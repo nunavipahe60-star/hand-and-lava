@@ -1,0 +1,793 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hand and Lava</title>
+<style>
+  :root {
+    --bg: #0b0c18; --panel: #15172b; --ink: #e8e9f3; --muted: #9094b3; --line: #2a2d4a;
+    --accent: #e05aa8; --good: #8fd16a; --bad: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; }
+  main { display: flex; flex-wrap: wrap; gap: 16px; padding: 16px; align-items: flex-start; }
+  #boardWrap { flex: 1 1 640px; min-width: 0; }
+  canvas { width: 100%; height: auto; display: block; border-radius: 8px; background: #12142a; image-rendering: auto; }
+  aside { flex: 0 1 340px; display: flex; flex-direction: column; gap: 12px; min-width: 260px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 8px; }
+  #status { font-weight: 600; }
+  #status.win { color: var(--good); } #status.lost { color: var(--bad); }
+  ul#rules { list-style: none; margin: 0; padding: 0; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
+  ul#rules li { padding: 2px 0; }
+  .kbd { display: inline-block; border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; font-size: 12px; background: #1d2040; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+  label { color: var(--muted); }
+  input[type=number] { width: 72px; background: #0f1124; color: var(--ink); border: 1px solid var(--line); border-radius: 4px; padding: 3px 6px; }
+  button { background: #262a52; color: var(--ink); border: 1px solid #3a3f78; border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit; }
+  button:hover:not(:disabled) { background: #323772; }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  #solveOut { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all; color: var(--muted); }
+  #solveOut b { color: var(--ink); }
+  .small { font-size: 12px; color: var(--muted); }
+  .pad { display: none; grid-template-columns: repeat(3, 48px); gap: 6px; justify-content: center; margin-top: 10px; }
+  .pad button { padding: 10px 0; }
+  @media (pointer: coarse) { .pad { display: grid; } }
+</style>
+</head>
+<body>
+<main>
+  <div id="boardWrap">
+    <canvas id="board" width="1344" height="768" aria-label="Level board"></canvas>
+    <div class="pad">
+      <span></span><button data-a="1">↑</button><span></span>
+      <button data-a="2">←</button><button data-a="4">wait</button><button data-a="0">→</button>
+      <button data-a="undo">undo</button><button data-a="3">↓</button><button data-a="restart">reset</button>
+    </div>
+  </div>
+  <aside>
+    <section>
+      <h1>Hand and Lava</h1>
+      <div>Turn <span id="turn">0</span> · <span id="status">Playing</span></div>
+      <div class="small" style="margin-top:6px">
+        <span class="kbd">←↑→↓</span>/<span class="kbd">WASD</span> move · <span class="kbd">Space</span> wait ·
+        <span class="kbd">Z</span> undo · <span class="kbd">R</span> restart
+      </div>
+    </section>
+    <section>
+      <h2>Active rules</h2>
+      <ul id="rules"></ul>
+    </section>
+    <section>
+      <h2>Solver (breadth-first)</h2>
+      <div class="row"><label for="maxDepth">Max depth</label><input id="maxDepth" type="number" min="1" value="60">
+        <label for="timeLimit">Time (s)</label><input id="timeLimit" type="number" min="1" value="120"></div>
+      <div class="row"><label for="maxStates">Max states</label><input id="maxStates" style="width:110px" type="number" min="1000" step="100000" value="3000000"></div>
+      <div class="row"><label><input type="checkbox" id="maskTextDir"> Treat text facing as cosmetic (exact for this level)</label></div>
+      <div class="row"><label><input type="checkbox" id="maskIdleDir"> Ignore facing of non-MOVE objects (faster, may miss solutions)</label></div>
+      <div class="row"><button id="solveBtn" class="primary">Solve</button><button id="stopBtn" disabled>Stop</button>
+        <button id="replayBtn" disabled>Replay solution</button></div>
+      <div id="solveOut">Searches from the starting position.</div>
+    </section>
+    <section>
+      <h2>Rule options</h2>
+      <div class="row"><label><input type="checkbox" id="shutBlocks"> SHUT blocks non-OPEN movers (like STOP)</label></div>
+      <div class="row"><label><input type="checkbox" id="showAllFacing"> Show facing on water, lava and text too</label></div>
+      <div class="small">Changing a rule option restarts the level.</div>
+    </section>
+  </aside>
+</main>
+
+<script id="engineSrc">
+// ===== Engine (shared by the page and the solver worker) =====
+var W = 28, H = 16;
+var OBJ_NAMES = ['BABA','HAND','DOOR','FLAG','WALL','WATER','LAVA'];
+var WORDS = ['BABA','HAND','DOOR','FLAG','WALL','WATER','LAVA',
+             'IS','NOT','ON','HAS','AND',
+             'YOU','MOVE','PUSH','STOP','WIN','DEFEAT','OPEN','SHUT'];
+var NOBJ = OBJ_NAMES.length;          // object types 0..6, text types 7..26
+var W_IS = 7, W_NOT = 8, W_ON = 9, W_HAS = 10, W_AND = 11, W_PROP0 = 12;
+var P_YOU = 1, P_MOVE = 2, P_PUSH = 4, P_STOP = 8, P_WIN = 16, P_DEFEAT = 32, P_OPEN = 64, P_SHUT = 128;
+var DX = [1, 0, -1, 0], DY = [0, -1, 0, 1];   // 0 right, 1 up, 2 left, 3 down
+var DIR_NAMES = ['right', 'up', 'left', 'down'];
+var ACTION_NAMES = ['→', '↑', '←', '↓', '·'];  // 4 = wait
+
+function isNounWord(w) { return w >= 0 && w < NOBJ; }
+function isPropWord(w) { return w >= W_PROP0; }
+function isText(t) { return t >= NOBJ; }
+function textType(word) { return NOBJ + WORDS.indexOf(word); }
+function propBit(w) { return 1 << (w - W_PROP0); }
+
+function enc(t, x, y, d) { return (t << 11) | (x << 6) | (y << 2) | d; }
+function cT(c) { return c >> 11; }
+function cX(c) { return (c >> 6) & 31; }
+function cY(c) { return (c >> 2) & 15; }
+function cD(c) { return c & 3; }
+
+// ---------- Level ----------
+var LEVEL_MAP = [
+  '.....~~~~~~~~~~~~~~winy~~...',
+  '....~~~~~~~~~~~~~~~~~~~~~...',
+  '...~~~~~~~....##..~~D~~~~~..',
+  '...~~~~~~...h.##...~.~~~~~..',
+  '...~~~~~..B.i.##...~.~~~~~..',
+  '...~~~~~....m.##.....~~~~...',
+  '..~~~~~~.biy..##.H.~~l~~~...',
+  '..~~~~~~......##...~d.u~~...',
+  '.~~~~~~~......##...~~i~~....',
+  '.~~~~~~~~~######~~~~~e~~....',
+  '.~~~~~~~~~######~~~~~.~~....',
+  '..~~~...#..........~~#~~....',
+  'dxf~~.o.#..........#..~~~...',
+  'fiv.~...#..WW..wip.#.~~~~~..',
+  'wiw.~~~~~..WW......~~~~~~~~.',
+  'tis..~~~~..........~~~~~~hik'
+];
+var LEGEND = {
+  '~': 'o:WATER', '#': 'o:LAVA', 'B': 'o:BABA', 'H': 'o:HAND', 'D': 'o:DOOR', 'W': 'o:WALL',
+  'b': 'BABA', 'h': 'HAND', 'd': 'DOOR', 'f': 'FLAG', 'w': 'WALL', 'l': 'LAVA', 't': 'WATER',
+  'i': 'IS', 'n': 'NOT', 'o': 'ON', 'x': 'HAS', 'y': 'YOU', 'm': 'MOVE', 'p': 'PUSH',
+  's': 'STOP', 'v': 'WIN', 'e': 'DEFEAT', 'k': 'OPEN', 'u': 'SHUT'
+};
+var START_DIR = { BABA: 0, HAND: 3 };   // Baba faces right, Hand faces down; everything else right
+
+function initialCodes() {
+  var codes = [];
+  for (var y = 0; y < H; y++) for (var x = 0; x < W; x++) {
+    var ch = LEVEL_MAP[y][x], L = LEGEND[ch];
+    if (!L) continue;
+    if (L.slice(0, 2) === 'o:') {
+      var name = L.slice(2);
+      codes.push(enc(OBJ_NAMES.indexOf(name), x, y, START_DIR[name] || 0));
+    } else codes.push(enc(textType(L), x, y, 0));
+  }
+  codes.sort(function (a, b) { return a - b; });
+  return codes;
+}
+
+// ---------- Rule parsing ----------
+// rule: {subj, subjNot, conds:[{noun,not}], verb:W_IS|W_HAS, neg, obj}
+function parseNounGroup(w, j) {
+  var list = [];
+  while (true) {
+    var k = j, nots = 0;
+    while (w[k] === W_NOT) { nots++; k++; }
+    if (!isNounWord(w[k])) break;
+    list.push({ noun: w[k], not: (nots & 1) === 1 });
+    j = k + 1;
+    if (w[j] === W_AND) {
+      var k2 = j + 1;
+      while (w[k2] === W_NOT) k2++;
+      if (isNounWord(w[k2])) { j = j + 1; continue; }
+    }
+    break;
+  }
+  return list.length ? { list: list, next: j } : null;
+}
+
+function parseSentence(w, i) {
+  var s = parseNounGroup(w, i);
+  if (!s) return null;
+  var j = s.next, conds = [];
+  if (w[j] === W_ON) {
+    var c = parseNounGroup(w, j + 1);
+    if (!c) return null;
+    conds = c.list; j = c.next;
+  }
+  if (w[j] !== W_IS && w[j] !== W_HAS) return null;
+  var rules = [], verb = -1, end = j;
+  while (true) {
+    if (w[j] === W_IS || w[j] === W_HAS) { verb = w[j]; j++; }
+    var k = j, nots = 0;
+    while (w[k] === W_NOT) { nots++; k++; }
+    var t = w[k];
+    var ok = verb === W_IS ? (isNounWord(t) || isPropWord(t)) : isNounWord(t);
+    if (!ok) break;
+    for (var a = 0; a < s.list.length; a++)
+      rules.push({ subj: s.list[a].noun, subjNot: s.list[a].not, conds: conds,
+                   verb: verb, neg: (nots & 1) === 1, obj: t });
+    j = k + 1; end = j;
+    if (w[j] === W_AND) { j++; continue; }
+    break;
+  }
+  return rules.length ? { rules: rules, start: i, end: end } : null;
+}
+
+function parseLine(w, out) {
+  var sents = [];
+  for (var i = 0; i < w.length; i++) if (w[i] >= 0) {
+    var s = parseSentence(w, i);
+    if (s) sents.push(s);
+  }
+  for (var a = 0; a < sents.length; a++) {
+    var inner = false;
+    for (var b = 0; b < sents.length; b++)
+      if (a !== b && sents[b].start <= sents[a].start && sents[b].end >= sents[a].end &&
+          (sents[b].end - sents[b].start) > (sents[a].end - sents[a].start)) { inner = true; break; }
+    if (!inner) for (var r = 0; r < sents[a].rules.length; r++) out.push(sents[a].rules[r]);
+  }
+}
+
+function ruleKey(r) {
+  return r.subjNot + ',' + r.subj + ',' + r.conds.map(function (c) { return c.not + ':' + c.noun; }).join('/') +
+         ',' + r.verb + ',' + r.neg + ',' + r.obj;
+}
+
+function parseRules(st) {
+  var grid = new Int8Array(W * H).fill(-1);
+  for (var i = 0; i < st.n; i++) if (st.alive[i] && isText(st.t[i])) grid[st.y[i] * W + st.x[i]] = st.t[i] - NOBJ;
+  var out = [], line = [];
+  for (var y = 0; y < H; y++) { line.length = 0; for (var x = 0; x < W; x++) line.push(grid[y * W + x]); parseLine(line, out); }
+  for (var x2 = 0; x2 < W; x2++) { line.length = 0; for (var y2 = 0; y2 < H; y2++) line.push(grid[y2 * W + x2]); parseLine(line, out); }
+  var seen = {}, rules = [];
+  for (var k = 0; k < out.length; k++) { var key = ruleKey(out[k]); if (!seen[key]) { seen[key] = 1; rules.push(out[k]); } }
+  return rules;
+}
+
+function ruleText(r) {
+  var s = (r.subjNot ? 'NOT ' : '') + WORDS[r.subj];
+  if (r.conds.length) s += ' ON ' + r.conds.map(function (c) { return (c.not ? 'NOT ' : '') + WORDS[c.noun]; }).join(' AND ');
+  return s + ' ' + WORDS[r.verb] + ' ' + (r.neg ? 'NOT ' : '') + WORDS[r.obj];
+}
+
+// ---------- State (typed arrays + per-cell linked lists) ----------
+function makeState(codes) {
+  var n = codes.length, cap = n + 32;
+  var st = { n: n, cap: cap,
+    t: new Uint8Array(cap), x: new Uint8Array(cap), y: new Uint8Array(cap), d: new Uint8Array(cap),
+    alive: new Uint8Array(cap), props: new Uint16Array(cap), nxt: new Int16Array(cap),
+    head: new Int16Array(W * H).fill(-1), R: null, allProps: 0 };
+  for (var i = 0; i < n; i++) {
+    var c = codes[i];
+    st.t[i] = cT(c); st.x[i] = cX(c); st.y[i] = cY(c); st.d[i] = cD(c); st.alive[i] = 1;
+    link(st, i);
+  }
+  return st;
+}
+
+function cloneState(s) {
+  return { n: s.n, cap: s.cap, t: s.t.slice(), x: s.x.slice(), y: s.y.slice(), d: s.d.slice(),
+    alive: s.alive.slice(), props: s.props.slice(), nxt: s.nxt.slice(), head: s.head.slice(),
+    R: s.R, allProps: s.allProps };
+}
+
+function link(st, i) { var c = st.y[i] * W + st.x[i]; st.nxt[i] = st.head[c]; st.head[c] = i; }
+function unlink(st, i) {
+  var c = st.y[i] * W + st.x[i], p = st.head[c];
+  if (p === i) { st.head[c] = st.nxt[i]; return; }
+  while (st.nxt[p] !== i) p = st.nxt[p];
+  st.nxt[p] = st.nxt[i];
+}
+
+function addObj(st, t, x, y, d) {
+  if (st.n >= st.cap) {
+    var cap = st.cap * 2;
+    ['t', 'x', 'y', 'd', 'alive'].forEach(function (k) { var a = new Uint8Array(cap); a.set(st[k]); st[k] = a; });
+    var p = new Uint16Array(cap); p.set(st.props); st.props = p;
+    var q = new Int16Array(cap); q.set(st.nxt); st.nxt = q;
+    st.cap = cap;
+  }
+  var i = st.n++;
+  st.t[i] = t; st.x[i] = x; st.y[i] = y; st.d[i] = d; st.alive[i] = 1; st.props[i] = 0;
+  link(st, i);
+  return i;
+}
+
+function destroy(st, i) { st.alive[i] = 0; unlink(st, i); }
+
+// ---------- Rule context (cached per text layout) ----------
+var RULE_CACHE = new Map();
+function textLayoutKey(st) {
+  var a = [];
+  for (var i = 0; i < st.n; i++) if (st.alive[i] && isText(st.t[i])) a.push((st.t[i] << 9) | (st.x[i] << 4) | st.y[i]);
+  a.sort(function (p, q) { return p - q; });
+  return String.fromCharCode.apply(null, a);
+}
+
+function buildCtx(rules) {
+  var NT = NOBJ + WORDS.length;
+  var pos = new Uint16Array(NT), neg = new Uint16Array(NT), typeProps = new Uint16Array(NT);
+  var condProp = [], xform = [], has = [];
+  for (var r = 0; r < rules.length; r++) {
+    var R = rules[r];
+    if (R.verb === W_HAS) has.push(R);
+    else if (isNounWord(R.obj)) xform.push(R);
+    else if (R.conds.length) condProp.push(R);
+    else for (var t = 0; t < NOBJ; t++) if (subjMatches(R, t)) {
+      if (R.neg) neg[t] |= propBit(R.obj); else pos[t] |= propBit(R.obj);
+    }
+  }
+  for (var t2 = 0; t2 < NT; t2++) typeProps[t2] = isText(t2) ? P_PUSH : (pos[t2] & ~neg[t2]);
+  return { rules: rules, pos: pos, neg: neg, typeProps: typeProps, condProp: condProp, xform: xform, has: has };
+}
+
+function getRules(st) {
+  var key = textLayoutKey(st), ctx = RULE_CACHE.get(key);
+  if (!ctx) {
+    if (RULE_CACHE.size > 50000) RULE_CACHE.clear();
+    ctx = buildCtx(parseRules(st));
+    RULE_CACHE.set(key, ctx);
+  }
+  return ctx;
+}
+
+function condHolds(st, i, conds) {
+  var c0 = st.y[i] * W + st.x[i];
+  for (var c = 0; c < conds.length; c++) {
+    var cd = conds[c], found = false;
+    for (var p = st.head[c0]; p !== -1; p = st.nxt[p]) {
+      if (p === i || isText(st.t[p])) continue;
+      if (cd.not ? st.t[p] !== cd.noun : st.t[p] === cd.noun) { found = true; break; }
+    }
+    if (!found) return false;
+  }
+  return true;
+}
+
+function subjMatches(r, t) { return !isText(t) && (r.subjNot ? t !== r.subj : t === r.subj); }
+
+function computeProps(st) {
+  var R = st.R, tp = R.typeProps, cr = R.condProp, all = 0;
+  for (var i = 0; i < st.n; i++) {
+    if (!st.alive[i]) continue;
+    var t = st.t[i], p = tp[t];
+    if (cr.length && !isText(t)) {
+      var pos = R.pos[t], neg = R.neg[t];
+      for (var r = 0; r < cr.length; r++) {
+        var Q = cr[r];
+        if (!subjMatches(Q, t) || !condHolds(st, i, Q.conds)) continue;
+        if (Q.neg) neg |= propBit(Q.obj); else pos |= propBit(Q.obj);
+      }
+      p = pos & ~neg;
+    }
+    st.props[i] = p; all |= p;
+  }
+  st.allProps = all;
+}
+
+function prepare(st) { st.R = getRules(st); computeProps(st); return st; }
+
+// ---------- Movement ----------
+function blocks(st, mover, p, opts) {
+  var pp = st.props[p], mo = st.props[mover];
+  if (pp & P_STOP) return !((pp & P_SHUT) && (mo & P_OPEN));
+  if (opts.shutBlocks && (pp & P_SHUT) && !(mo & P_OPEN)) return true;
+  return false;
+}
+
+function canMove(st, i, d, opts) {
+  var nx = st.x[i] + DX[d], ny = st.y[i] + DY[d];
+  if (nx < 0 || ny < 0 || nx >= W || ny >= H) return false;
+  for (var p = st.head[ny * W + nx]; p !== -1; p = st.nxt[p]) {
+    if (st.props[p] & P_PUSH) { if (!canMove(st, p, d, opts)) return false; }
+    else if (blocks(st, i, p, opts)) return false;
+  }
+  return true;
+}
+
+function doMove(st, i, d) {
+  var nx = st.x[i] + DX[d], ny = st.y[i] + DY[d], pushed = [];
+  for (var p = st.head[ny * W + nx]; p !== -1; p = st.nxt[p]) if (st.props[p] & P_PUSH) pushed.push(p);
+  for (var k = 0; k < pushed.length; k++) doMove(st, pushed[k], d);
+  unlink(st, i);
+  st.x[i] = nx; st.y[i] = ny; st.d[i] = d;   // pushed objects turn to face the push
+  link(st, i);
+}
+
+function hasList(st, i) {
+  var t = st.t[i], items = [], negs = 0, H_ = st.R.has;
+  for (var r = 0; r < H_.length; r++) {
+    var R = H_[r];
+    if (!subjMatches(R, t)) continue;
+    if (R.conds.length && !condHolds(st, i, R.conds)) continue;
+    if (R.neg) negs |= 1 << R.obj; else if (items.indexOf(R.obj) < 0) items.push(R.obj);
+  }
+  return { x: st.x[i], y: st.y[i], d: st.d[i], items: items.filter(function (q) { return !(negs & (1 << q)); }) };
+}
+
+// ---------- One turn ----------
+// st must be prepared. action: 0..3 direction, 4 wait. Mutates st, returns true on WIN.
+function step(st, action, opts) {
+  var i, k;
+  // 1. YOU moves
+  if (action < 4 && (st.allProps & P_YOU)) {
+    var you = [], d = action;
+    for (i = 0; i < st.n; i++) if (st.alive[i] && (st.props[i] & P_YOU)) you.push(i);
+    if (you.length > 1) you.sort(function (a, b) { return (st.x[b] - st.x[a]) * DX[d] + (st.y[b] - st.y[a]) * DY[d]; });
+    for (k = 0; k < you.length; k++) {
+      var o = you[k];
+      st.d[o] = d;
+      if (canMove(st, o, d, opts)) doMove(st, o, d);
+    }
+    if (st.R.condProp.length) computeProps(st);
+  }
+  // 2. MOVE moves
+  if (st.allProps & P_MOVE) {
+    var movers = [];
+    for (i = 0; i < st.n; i++) if (st.alive[i] && (st.props[i] & P_MOVE)) movers.push(i);
+    for (k = 0; k < movers.length; k++) {
+      var m = movers[k], dd = st.d[m];
+      if (canMove(st, m, dd, opts)) doMove(st, m, dd);
+      else {
+        dd = (dd + 2) & 3; st.d[m] = dd;
+        if (canMove(st, m, dd, opts)) doMove(st, m, dd);
+      }
+    }
+  }
+  // 3. rules update
+  st.R = getRules(st);
+  // 4. transformations (X IS X blocks; several targets -> all of them; facing kept)
+  var X = st.R.xform;
+  if (X.length) {
+    var nBefore = st.n;
+    for (i = 0; i < nBefore; i++) {
+      if (!st.alive[i] || isText(st.t[i])) continue;
+      var t = st.t[i], targets = [], blocked = false, negs = 0;
+      for (var r = 0; r < X.length; r++) {
+        var Q = X[r];
+        if (!subjMatches(Q, t)) continue;
+        if (Q.conds.length && !condHolds(st, i, Q.conds)) continue;
+        if (Q.neg) negs |= 1 << Q.obj;
+        else if (Q.obj === t) blocked = true;
+        else if (targets.indexOf(Q.obj) < 0) targets.push(Q.obj);
+      }
+      if (blocked) continue;
+      targets = targets.filter(function (q) { return !(negs & (1 << q)); });
+      if (!targets.length) continue;
+      var x = st.x[i], y = st.y[i], dir = st.d[i];
+      destroy(st, i);
+      for (var q = 0; q < targets.length; q++) addObj(st, targets[q], x, y, dir);
+    }
+  }
+  computeProps(st);
+  var dead = [], cell, p, c;
+  // 5. DEFEAT: YOU objects on a tile with a DEFEAT object are destroyed
+  if ((st.allProps & P_DEFEAT) && (st.allProps & P_YOU)) {
+    var kill = [];
+    for (i = 0; i < st.n; i++) {
+      if (!st.alive[i] || !(st.props[i] & P_YOU)) continue;
+      c = st.y[i] * W + st.x[i];
+      for (p = st.head[c]; p !== -1; p = st.nxt[p]) if (st.props[p] & P_DEFEAT) { kill.push(i); break; }
+    }
+    for (k = 0; k < kill.length; k++) { dead.push(hasList(st, kill[k])); destroy(st, kill[k]); }
+  }
+  // 6. OPEN/SHUT: on each tile, OPEN and SHUT objects destroy each other in pairs
+  if ((st.allProps & P_OPEN) && (st.allProps & P_SHUT)) {
+    var done = {};
+    for (i = 0; i < st.n; i++) {
+      if (!st.alive[i] || !(st.props[i] & (P_OPEN | P_SHUT))) continue;
+      c = st.y[i] * W + st.x[i];
+      if (done[c]) continue;
+      done[c] = 1;
+      var opens = [], shuts = [], both = [];
+      for (p = st.head[c]; p !== -1; p = st.nxt[p]) {
+        var pr = st.props[p];
+        if ((pr & P_OPEN) && (pr & P_SHUT)) both.push(p);
+        else if (pr & P_OPEN) opens.push(p);
+        else if (pr & P_SHUT) shuts.push(p);
+      }
+      var nPair = Math.min(opens.length, shuts.length);
+      var gone = both.concat(opens.slice(0, nPair), shuts.slice(0, nPair));
+      for (k = 0; k < gone.length; k++) dead.push(hasList(st, gone[k]));
+      for (k = 0; k < gone.length; k++) destroy(st, gone[k]);
+    }
+  }
+  // 7. HAS: destroyed objects leave what they HAS
+  for (k = 0; k < dead.length; k++) {
+    var D = dead[k];
+    for (var z = 0; z < D.items.length; z++) addObj(st, D.items[z], D.x, D.y, D.d);
+  }
+  if (dead.length) computeProps(st);
+  // 8. WIN: a YOU object on a tile with a WIN object
+  if ((st.allProps & P_YOU) && (st.allProps & P_WIN)) {
+    for (i = 0; i < st.n; i++) {
+      if (!st.alive[i] || !(st.props[i] & P_YOU)) continue;
+      for (p = st.head[st.y[i] * W + st.x[i]]; p !== -1; p = st.nxt[p]) if (st.props[p] & P_WIN) return true;
+    }
+  }
+  return false;
+}
+
+// ---------- Compact state keys (diff against the initial layout) ----------
+// maskTextDir: text facing is cosmetic (no TEXT noun exists, so text can never be MOVE).
+// maskIdleDir: also ignore facing of objects that are not MOVE right now (inexact pruning).
+function stateCodes(st, maskTextDir, maskIdleDir) {
+  var codes = new Uint16Array(st.n), m = 0;
+  for (var i = 0; i < st.n; i++) if (st.alive[i]) {
+    var d = st.d[i];
+    if (maskTextDir && isText(st.t[i])) d = 0;
+    else if (maskIdleDir && !(st.props[i] & P_MOVE)) d = 0;
+    codes[m++] = enc(st.t[i], st.x[i], st.y[i], d);
+  }
+  return codes.subarray(0, m).sort();
+}
+
+function diffKey(base, codes) {
+  var rem = [], add = [], i = 0, j = 0;
+  while (i < base.length || j < codes.length) {
+    if (j >= codes.length || (i < base.length && base[i] < codes[j])) rem.push(base[i++]);
+    else if (i >= base.length || codes[j] < base[i]) add.push(codes[j++]);
+    else { i++; j++; }
+  }
+  rem.push(0xFFFF);
+  return String.fromCharCode.apply(null, rem.concat(add));
+}
+
+function keyToCodes(base, key) {
+  var rem = [], add = [], k = 0;
+  for (; key.charCodeAt(k) !== 0xFFFF; k++) rem.push(key.charCodeAt(k));
+  for (k++; k < key.length; k++) add.push(key.charCodeAt(k));
+  var out = [], i = 0, r = 0;
+  for (; i < base.length; i++) { if (r < rem.length && rem[r] === base[i]) { r++; continue; } out.push(base[i]); }
+  return out.concat(add);
+}
+
+// ---------- BFS solver ----------
+// opts: {maxDepth, timeLimitMs, maxStates, maskTextDir, shutBlocks, onProgress(info)}
+function solveBFS(opts) {
+  var base = initialCodes();
+  var t0 = Date.now();
+  var keys = [diffKey(base, base)];
+  var parent = [-1], act = [-1], depth = [0];
+  var seen = new Map(); seen.set(keys[0], 0);
+  var head = 0, lastReport = t0, reason = 'exhausted';
+  while (head < keys.length) {
+    if (depth[head] >= opts.maxDepth) { reason = 'depth'; break; }
+    var now = Date.now();
+    if (now - t0 > opts.timeLimitMs) { reason = 'time'; break; }
+    if (keys.length > opts.maxStates) { reason = 'states'; break; }
+    if (opts.onProgress && now - lastReport > 250) {
+      lastReport = now;
+      if (opts.onProgress({ explored: head, seen: keys.length, depth: depth[head], ms: now - t0 }) === false) { reason = 'cancelled'; break; }
+    }
+    var codes = keyToCodes(base, keys[head]);
+    var st0 = prepare(makeState(codes));
+    var nActs = (st0.allProps & P_YOU) ? 5 : 1;
+    for (var a = 0; a < nActs; a++) {
+      var action = nActs === 1 ? 4 : a;
+      var st = cloneState(st0);
+      var won = step(st, action, opts);
+      if (won) {
+        var path = [action], p = head;
+        while (p > 0) { path.push(act[p]); p = parent[p]; }
+        path.reverse();
+        return { found: true, path: path, explored: head + 1, seen: keys.length, ms: Date.now() - t0 };
+      }
+      var k = diffKey(base, stateCodes(st, opts.maskTextDir, opts.maskIdleDir));
+      if (seen.has(k)) continue;
+      seen.set(k, keys.length);
+      keys.push(k); parent.push(head); act.push(action); depth.push(depth[head] + 1);
+    }
+    head++;
+  }
+  return { found: false, reason: reason, explored: head, seen: keys.length,
+           depth: head < depth.length ? depth[head] : depth[depth.length - 1], ms: Date.now() - t0 };
+}
+
+if (typeof module !== 'undefined') module.exports = {
+  initialCodes: initialCodes, makeState: makeState, prepare: prepare, cloneState: cloneState, step: step,
+  ruleText: ruleText, solveBFS: solveBFS, stateCodes: stateCodes, WORDS: WORDS
+};
+
+</script>
+<script>
+(function () {
+  var canvas = document.getElementById('board'), ctx = canvas.getContext('2d');
+  var TS = 48;
+  var opts = { shutBlocks: false };
+  var st, history, turn, won;
+  var replayTimer = null, solution = null, worker = null;
+
+  var OBJ_STYLE = {
+    BABA: { fill: '#f4f4f4', ink: '#111', label: 'BABA' },
+    HAND: { fill: '#f2c6a0', ink: '#3a2412', label: 'HAND' },
+    DOOR: { fill: '#e0569a', ink: '#fff', label: 'DOOR' },
+    FLAG: { fill: '#f2e35a', ink: '#3a3300', label: 'FLAG' },
+    WALL: { fill: '#5b6383', ink: '#e8e9f3', label: 'WALL' }
+  };
+  var WORD_COLOR = {
+    BABA: '#f4f4f4', HAND: '#f2c6a0', DOOR: '#e0569a', FLAG: '#f2e35a', WALL: '#8d95b8', WATER: '#6f8cff', LAVA: '#f0a93a',
+    IS: '#ffffff', NOT: '#ff6b6b', ON: '#ffffff', HAS: '#ffffff', AND: '#ffffff'
+  };
+  var PROP_COLOR = { YOU: '#d36ee0', MOVE: '#6cbf3c', PUSH: '#9b7a3a', STOP: '#3f8a3a', WIN: '#e9e86f',
+                     DEFEAT: '#9b2f3f', OPEN: '#d9e070', SHUT: '#b84a5a' };
+
+  function reset() {
+    stopReplay();
+    st = prepare(makeState(initialCodes()));
+    history = []; turn = 0; won = false;
+    render();
+  }
+
+  function act(a) {
+    if (won) return;
+    history.push({ st: cloneState(st), turn: turn });
+    won = step(st, a, opts);
+    computeProps(st);
+    turn++;
+    render();
+  }
+  function undo() {
+    stopReplay();
+    if (!history.length) return;
+    var h = history.pop(); st = h.st; turn = h.turn; won = false; render();
+  }
+
+  // ---------- drawing ----------
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+  }
+  function fitText(word, maxW, size) {
+    ctx.font = '700 ' + size + 'px system-ui, sans-serif';
+    while (ctx.measureText(word).width > maxW && size > 6) { size--; ctx.font = '700 ' + size + 'px system-ui, sans-serif'; }
+  }
+  function drawArrow(px, py, d, color) {
+    var c = TS / 2, a = 6, cx = px + c + DX[d] * (c - 4), cy = py + c + DY[d] * (c - 4);
+    var ox = -DY[d], oy = DX[d];
+    ctx.fillStyle = color; ctx.beginPath();
+    ctx.moveTo(cx + DX[d] * 3, cy + DY[d] * 3);
+    ctx.lineTo(cx - DX[d] * a + ox * a, cy - DY[d] * a + oy * a);
+    ctx.lineTo(cx - DX[d] * a - ox * a, cy - DY[d] * a - oy * a);
+    ctx.closePath(); ctx.fill();
+  }
+
+  function render() {
+    var showAll = document.getElementById('showAllFacing').checked;
+    ctx.fillStyle = '#12142a'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)'; ctx.lineWidth = 1;
+    for (var gx = 0; gx <= W; gx++) { ctx.beginPath(); ctx.moveTo(gx * TS + .5, 0); ctx.lineTo(gx * TS + .5, H * TS); ctx.stroke(); }
+    for (var gy = 0; gy <= H; gy++) { ctx.beginPath(); ctx.moveTo(0, gy * TS + .5); ctx.lineTo(W * TS, gy * TS + .5); ctx.stroke(); }
+    var order = [];
+    for (var i = 0; i < st.n; i++) if (st.alive[i]) order.push(i);
+    var rank = function (t) { return t === 5 || t === 6 ? 0 : isText(t) ? 2 : 1; };
+    order.sort(function (a, b) { return rank(st.t[a]) - rank(st.t[b]); });
+    var stackCount = {};
+    order.forEach(function (i) {
+      var t = st.t[i], px = st.x[i] * TS, py = st.y[i] * TS, d = st.d[i], cell = st.y[i] * W + st.x[i];
+      if (t === 5 || t === 6) {
+        ctx.fillStyle = t === 5 ? '#3a5bc7' : '#e0a030';
+        roundRect(px + 1, py + 1, TS - 2, TS - 2, 7); ctx.fill();
+        if (showAll) drawArrow(px, py, d, 'rgba(0,0,0,0.45)');
+        return;
+      }
+      var k = stackCount[cell] = (stackCount[cell] || 0) + 1, off = (k - 1) * 3;
+      px += off; py += off;
+      if (isText(t)) {
+        var word = WORDS[t - NOBJ], isProp = t - NOBJ >= W_PROP0;
+        roundRect(px + 2, py + 2, TS - 4, TS - 4, 5);
+        ctx.fillStyle = isProp ? PROP_COLOR[word] : '#0b0c18'; ctx.fill();
+        ctx.lineWidth = 1.5; ctx.strokeStyle = isProp ? 'rgba(0,0,0,0.3)' : (WORD_COLOR[word] || '#fff'); ctx.stroke();
+        ctx.fillStyle = isProp ? '#111' : (WORD_COLOR[word] || '#fff');
+        fitText(word, TS - 8, 14);
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(word, px + TS / 2, py + TS / 2 + 1);
+        if (showAll) drawArrow(px, py, d, 'rgba(255,255,255,0.5)');
+        return;
+      }
+      var s = OBJ_STYLE[OBJ_NAMES[t]];
+      roundRect(px + 3, py + 3, TS - 6, TS - 6, 9); ctx.fillStyle = s.fill; ctx.fill();
+      ctx.fillStyle = s.ink; fitText(s.label, TS - 14, 12);
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(s.label, px + TS / 2, py + TS / 2 + 1);
+      drawArrow(px, py, d, '#ff4fa3');
+    });
+    if (won) {
+      ctx.fillStyle = 'rgba(0,0,0,0.45)'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = '#f2e35a'; ctx.font = '800 64px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('WIN!', canvas.width / 2, canvas.height / 2);
+    }
+    document.getElementById('turn').textContent = turn;
+    var status = document.getElementById('status');
+    status.className = won ? 'win' : (st.allProps & P_YOU) ? '' : 'lost';
+    status.textContent = won ? 'You win!' : (st.allProps & P_YOU) ? 'Playing' : 'Nothing is YOU (Space waits, Z undoes)';
+    var ul = document.getElementById('rules'); ul.innerHTML = '';
+    st.R.rules.map(ruleText).sort().forEach(function (r) { var li = document.createElement('li'); li.textContent = r; ul.appendChild(li); });
+  }
+
+  // ---------- input ----------
+  var KEYMAP = { ArrowRight: 0, d: 0, D: 0, ArrowUp: 1, w: 1, W: 1, ArrowLeft: 2, a: 2, A: 2, ArrowDown: 3, s: 3, S: 3, ' ': 4 };
+  document.addEventListener('keydown', function (e) {
+    if (e.target.tagName === 'INPUT') return;
+    if (e.key in KEYMAP) { e.preventDefault(); stopReplay(); act(KEYMAP[e.key]); }
+    else if (e.key === 'z' || e.key === 'Z') { e.preventDefault(); undo(); }
+    else if (e.key === 'r' || e.key === 'R') { e.preventDefault(); reset(); }
+  });
+  document.querySelectorAll('.pad button').forEach(function (b) {
+    b.addEventListener('click', function () {
+      var a = b.dataset.a;
+      if (a === 'undo') undo(); else if (a === 'restart') reset(); else { stopReplay(); act(+a); }
+    });
+  });
+  document.getElementById('shutBlocks').addEventListener('change', function (e) { opts.shutBlocks = e.target.checked; reset(); });
+  document.getElementById('showAllFacing').addEventListener('change', render);
+
+  // ---------- solver (runs in a Web Worker) ----------
+  var out = document.getElementById('solveOut');
+  var solveBtn = document.getElementById('solveBtn'), stopBtn = document.getElementById('stopBtn'), replayBtn = document.getElementById('replayBtn');
+  function fmt(n) { return n.toLocaleString(); }
+  function pathText(p) { return p.map(function (a) { return ACTION_NAMES[a]; }).join(' '); }
+
+  solveBtn.addEventListener('click', function () {
+    if (worker) return;
+    var src = document.getElementById('engineSrc').textContent +
+      '\nself.onmessage = function (e) {' +
+      '  var o = e.data;' +
+      '  o.onProgress = function (info) { self.postMessage({ type: "progress", info: info }); };' +
+      '  self.postMessage({ type: "done", result: solveBFS(o) });' +
+      '};';
+    worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+    var params = {
+      maxDepth: Math.max(1, +document.getElementById('maxDepth').value || 60),
+      timeLimitMs: Math.max(1, +document.getElementById('timeLimit').value || 120) * 1000,
+      maxStates: Math.max(1000, +document.getElementById('maxStates').value || 3e6),
+      maskTextDir: document.getElementById('maskTextDir').checked,
+      maskIdleDir: document.getElementById('maskIdleDir').checked,
+      shutBlocks: opts.shutBlocks
+    };
+    solution = null; replayBtn.disabled = true; solveBtn.disabled = true; stopBtn.disabled = false;
+    out.textContent = 'Starting…';
+    worker.onmessage = function (e) {
+      var m = e.data;
+      if (m.type === 'progress') {
+        var i = m.info;
+        out.innerHTML = 'Searching… depth <b>' + i.depth + '</b> · explored <b>' + fmt(i.explored) +
+          '</b> · seen <b>' + fmt(i.seen) + '</b> · ' + (i.ms / 1000).toFixed(1) + 's';
+        return;
+      }
+      finishSolve(m.result);
+    };
+    worker.postMessage(params);
+  });
+  stopBtn.addEventListener('click', function () {
+    if (!worker) return;
+    worker.terminate(); worker = null;
+    solveBtn.disabled = false; stopBtn.disabled = true;
+    out.textContent += '\nStopped.';
+  });
+
+  function finishSolve(r) {
+    worker.terminate(); worker = null;
+    solveBtn.disabled = false; stopBtn.disabled = true;
+    var stats = 'explored ' + fmt(r.explored) + ' states, seen ' + fmt(r.seen) + ', ' + (r.ms / 1000).toFixed(1) + 's';
+    if (r.found) {
+      solution = r.path; replayBtn.disabled = false;
+      out.innerHTML = '<b>Solved in ' + r.path.length + ' moves</b> (' + stats + ')\n' + pathText(r.path) +
+        '\n(→↑←↓ = moves, · = wait)';
+      return;
+    }
+    var why = { exhausted: 'Every reachable state was explored and none wins.',
+                depth: 'Reached the depth limit without a win.',
+                time: 'Hit the time limit.', states: 'Hit the state limit.' }[r.reason] || r.reason;
+    var msg = '<b>No solution found.</b> ' + why + '\nSearched every move sequence up to depth ' + r.depth + ' (' + stats + ').';
+    if (r.reason !== 'exhausted') msg +=
+      '\n\nThe search is too big for plain BFS: the number of new states roughly doubles with every extra move, ' +
+      'because nearly every push of a text block creates a new layout. Pruning ideas:' +
+      '\n• Tick "text facing is cosmetic" (exact here, small gain).' +
+      '\n• Tick "ignore facing of non-MOVE objects" (about 2× fewer states, may miss tricks that rely on facing).' +
+      '\n• Sokoban-style macro moves: treat Baba walking to a tile as one step, branch only on pushes.' +
+      '\n• Freeze text that cannot reach a useful spot (blocks walled in by water).' +
+      '\n• Use A* or iterative deepening with a heuristic (distance to the cross of LAVA/DOOR/SHUT text, or to the door).';
+    out.innerHTML = msg;
+  }
+
+  // ---------- replay ----------
+  function stopReplay() { if (replayTimer) { clearInterval(replayTimer); replayTimer = null; replayBtn.textContent = 'Replay solution'; } }
+  replayBtn.addEventListener('click', function () {
+    if (replayTimer) { stopReplay(); return; }
+    if (!solution) return;
+    reset();
+    var k = 0;
+    replayBtn.textContent = 'Stop replay';
+    replayTimer = setInterval(function () {
+      if (k >= solution.length) { stopReplay(); return; }
+      act(solution[k++]);
+    }, 220);
+  });
+
+  reset();
+})();
+</script>
+</body>
+</html>
